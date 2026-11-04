@@ -42,6 +42,8 @@ Homepage = "https://uni-robot-agent.com/"
 tui = []
 codex = []
 claude = []
+# The steward adapter launches the dsh runtime through its Python SDK.
+steward = ["deepseek-harness-sdk>=0.2.1rc2"]
 dev = ["build>=1", "twine>=6", "tomli-w>=1"]
 robolab = ["scipy>=1.10", "trimesh>=4,<5", "python-fcl>=0.7,<0.8"]
 robodojo = [

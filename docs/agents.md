@@ -124,3 +124,27 @@ sessions. Each TUI accepts one task; start another TUI for a new task.
 Validate SDK changes against the pinned Claude CLI and a local scripted Messages
 provider, including large image round trips, multiple tool calls, finish, retries
 and cancellation. These checks can run without a commercial model or robot.
+
+## steward (DeepSeek Harness)
+
+`--agent steward` runs the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+loop as a child process through `deepseek-harness-sdk` (the `steward` extra).
+The adapter starts the same `HttpMcpServer` the Codex adapter uses, writes a
+generated Cordis patch, and lets dsh connect to it, so the shared tools, resource
+scheduling and episode state are unchanged.
+
+Configuration: `--steward-dsh-home` (or `DSH_HOME`) is the harness home the SDK
+requires. `--steward-provider`/`--steward-base-url` (or `--provider-url`) declare
+the model route the generated patch registers through `llm-pi-ai`; the route
+declares `[text, image]` so observation images survive the MCP image gate.
+uni-robot-agent's own provider gateway stays closed: dsh owns model transport,
+retries and records. `--no-steward-native-tools` disables dsh's bash, filesystem,
+web and skill plugins when a real robot must not reach host state. Only the
+`identity` context policy is supported. Agent success requires a `finish` call
+that was accepted or completed, plus a normal SDK termination.
+
+Native model records live in the dsh home, not under the session's trace
+directory; provider-faithful SFT export is unsupported. Validate SDK changes
+against the pinned `deepseek-harness-sdk` and a local OpenAI-compatible endpoint,
+including an image-bearing tool result, a background `finish` acknowledgement and
+cancellation.
