@@ -33,6 +33,8 @@ def create_session(context):
 def get_integration_spec():
     from uni_robot_agent.integrations.gripper import build_gripper_spec
 
+    from . import prompt  # Register environment context without loading MuJoCo.
+
     return build_gripper_spec(name="cobot_magic", create_session=create_session,
                               add_cli_args=add_cli_args, validate_cli=validate_cli,
                               config_model=CobotMagicOptions)
