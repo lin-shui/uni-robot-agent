@@ -13,6 +13,7 @@ checkpoints remain separate.
 | `robodojo` | Official RoboDojo simulation, task requirements and bundled gripper skills | RoboDojo environment; Hybrid adds an identified Pi0.5 model and a reviewer by default |
 | `robouse` | Direct simulation tasks, including LIBERO and RoboCasa | Prepared profile-specific RoboUse environment |
 | `robolab` | RoboLab DROID, Direct scalar-gripper control | Prepared RoboLab/Isaac environment; RGB cameras |
+| `cobot_magic` | Steward WSim twin of the dual-Piper Cobot Magic, Direct control | Twin episode service; the `steward` Python package in the service interpreter |
 
 These simulation integrations share scene, gripper, skill and episode tools.
 RoboDojo supports Direct and Hybrid; RoboUse and RoboLab support Direct only.
@@ -178,6 +179,39 @@ See [deployment profiles](deployment.md#environment-profiles-and-limits),
 for a prepared single-DROID episode. See [RoboLab setup](robolab.md) for runtime
 requirements, coordinate frames and supported features. The integration uses RGB
 and calibrated multi-view triangulation, with no actor or SAM3 binding.
+
+## Cobot Magic twin
+
+`--integration cobot_magic` drives the steward project's MuJoCo twin of a dual
+Piper Cobot Magic over the shared gripper, scene, skill and finish providers.
+The twin runs as a standalone episode service; the agent connects with
+`--env-url`. Start it from a checkout with the steward package installed in the
+same interpreter:
+
+```bash
+python -m uni_robot_agent.integrations.cobot_magic.environment.server \
+  --root /path/to/steward/var/steward --scenario cobot-table \
+  --task bowl-on-plate --instruction "Put the bowl on the plate." \
+  --output-dir ./runs/twin --run-id twin-1 --port 18770
+```
+
+One service owns one episode: restart it for the next run. `--task` names the
+final check as `<upper>-on-<lower>` object categories, resolved from the twin's
+world relations, and is never shown to the agent. `--no-depth` keeps calibrated
+RGB; `--no-camera-calibration` requires `--no-depth`.
+
+Arms expose `left` and `right` with world-metre wxyz grasp-site targets, six
+joints and a normalized gripper opening. Each 25 Hz step solves IK against the
+twin's own model, commands joint targets and advances one control period.
+Measured pose error is folded back into the target so a loaded arm settles on
+the requested site, matching the twin's own integral compensation.
+
+Cameras are `head`, `left_wrist` and `right_wrist`, each returning RGB, metric
+depth and same-frame `intrinsic_K`/`T_world_from_optical`. Optical axes follow
+this harness's convention (+x right, +y down, +z forward); the twin's mount
+frame (+x forward, +y left, +z up) is converted at capture. In the bundled
+`cobot-table` scene the wrist cameras sit inside the gripper and return a
+near-black image; the head camera is the useful view.
 
 ## Model bindings and backends
 

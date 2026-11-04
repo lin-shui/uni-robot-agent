@@ -78,3 +78,6 @@ eval_results/
 
 # Local reference material; excluded from the public project
 /archive/
+
+# MuJoCo writes this beside the working directory during rendering
+MUJOCO_LOG.TXT
