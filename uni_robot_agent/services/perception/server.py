@@ -38,17 +38,35 @@ class BatchConfig(_Config):
         return self
 
 
+class RemoteConfig(_Config):
+    url: str = Field(min_length=1)
+    timeout_s: float = Field(default=450.0, gt=0)
+
+
 class PerceptionConfig(_Config):
-    backend: Literal["sam3"] = "sam3"
-    checkpoint: str = Field(min_length=1)
+    backend: Literal["sam3", "remote_sam3"] = "sam3"
+    checkpoint: str | None = None
     cuda_device: int | None = Field(default=None, ge=0)
+    remote: RemoteConfig | None = None
     http: HttpConfig = Field(default_factory=HttpConfig)
     batching: BatchConfig = Field(default_factory=BatchConfig)
+
+    @model_validator(mode="after")
+    def backend_options(self):
+        if self.backend == "sam3":
+            if not self.checkpoint or not self.checkpoint.strip():
+                raise ValueError("backend 'sam3' requires a checkpoint")
+        elif self.remote is None:
+            raise ValueError("backend 'remote_sam3' requires a remote url")
+        return self
 
 
 def _build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="uni-robot-agent perception service")
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--backend", choices=("sam3", "remote_sam3"))
+    parser.add_argument("--remote-url")
+    parser.add_argument("--remote-timeout", type=float)
     parser.add_argument("--checkpoint")
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
@@ -63,6 +81,14 @@ def main() -> None:
     parser = _build_argparser()
     args = parser.parse_args()
     settings = tomllib.loads(args.config.read_text()) if args.config else {}
+    if args.backend is not None:
+        settings["backend"] = args.backend
+    if args.remote_url is not None or args.remote_timeout is not None:
+        remote = settings.setdefault("remote", {})
+        if args.remote_url is not None:
+            remote["url"] = args.remote_url
+        if args.remote_timeout is not None:
+            remote["timeout_s"] = args.remote_timeout
     for key in ("checkpoint", "cuda_device"):
         if getattr(args, key) is not None:
             settings[key] = getattr(args, key)
@@ -81,9 +107,17 @@ def main() -> None:
     if config.cuda_device is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(config.cuda_device)
     logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
-    from .backends.sam3 import Sam3Backend
+    if config.backend == "sam3":
+        from .backends.sam3 import Sam3Backend
 
-    backend = Sam3Backend.load(config.checkpoint)
+        backend = Sam3Backend.load(config.checkpoint)
+    else:
+        from .backends.remote_sam3 import RemoteSam3Backend
+
+        assert config.remote is not None
+        backend = RemoteSam3Backend.connect(
+            config.remote.url, timeout_s=config.remote.timeout_s,
+        )
     service = None
     try:
         service = PerceptionService(backend, **config.batching.model_dump())
