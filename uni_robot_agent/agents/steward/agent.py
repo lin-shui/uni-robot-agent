@@ -41,7 +41,10 @@ class _RecordingExecutor:
         with self._lock:
             self.tool_calls += 1
             if name == "finish":
-                self.finish = result
+                accepted = getattr(result, "status", "") == "accepted"
+                completed = getattr(result, "output", None)
+                if self.finish is None or accepted or (completed is not None and completed.success):
+                    self.finish = result
         return result
 
 
@@ -52,7 +55,8 @@ class StewardAgent(StewardConfig):
                  patches: tuple[str, ...] = (), provider: str | None = None,
                  base_url: str | None = None, api_key: str | None = None,
                  context_window: int = 262144, max_tokens: int = 32768,
-                 native_tools: bool = True, cwd: str | None = None) -> None:
+                 native_tools: bool = True, cwd: str | None = None,
+                 timeout_s: float | None = None) -> None:
         self._model = model
         self._dsh_home = dsh_home
         self._profile = profile
@@ -64,6 +68,9 @@ class StewardAgent(StewardConfig):
         self._max_tokens = max_tokens
         self._native_tools = native_tools
         self._cwd = cwd
+        self._timeout_s = timeout_s
+        self._timed_out = False
+        self._watchdog: threading.Timer | None = None
         self._harness = None
         self._cancel_reason: str | None = None
         self._cleanup_error: str | None = None
@@ -82,6 +89,14 @@ class StewardAgent(StewardConfig):
 
     def cancel(self, reason):
         self._cancel_reason = reason
+        self._close_harness()
+
+    def _expire(self):
+        """Stop the child runtime when the wall-clock budget runs out."""
+        self._timed_out = True
+        self._close_harness()
+
+    def _close_harness(self):
         harness = self._harness
         if harness is not None:
             try:
@@ -129,8 +144,15 @@ class StewardAgent(StewardConfig):
             try:
                 self._harness = harness
                 harness.start()
+                if self._timeout_s:
+                    self._watchdog = threading.Timer(self._timeout_s, self._expire)
+                    self._watchdog.daemon = True
+                    self._watchdog.start()
                 run = harness.run(prompt.user)
             finally:
+                if self._watchdog is not None:
+                    self._watchdog.cancel()
+                    self._watchdog = None
                 try:
                     harness.close()
                 except Exception as exc:  # noqa: BLE001 - report cleanup without masking
@@ -138,12 +160,15 @@ class StewardAgent(StewardConfig):
                     error = error or cleanup_error
                 self._harness = None
             response = run.final_response
-            if self._cancel_reason:
+            if self._timed_out:
+                stop_reason = "wall_time_limit"
+            elif self._cancel_reason:
                 stop_reason = self._cancel_reason
             elif run.finish_reason not in (None, "completed"):
                 stop_reason = str(run.finish_reason)
         except Exception as exc:  # noqa: BLE001 - surface the failure in AgentResult
-            error = f"{type(exc).__name__}: {exc}"
+            if not self._timed_out:
+                error = f"{type(exc).__name__}: {exc}"
         finally:
             self._harness = None
             try:
