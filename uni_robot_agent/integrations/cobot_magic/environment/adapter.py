@@ -34,6 +34,10 @@ CAMERAS = {
     "right_wrist": "R_wrist_camera",
 }
 CONTROL_HZ = 25.0
+JOINT_TOL = 0.03
+HOLD_TOL = 0.005
+MIN_TICKS = 8
+SETTLE_TICKS = 400
 _APERTURE_M = 0.10
 # Optical axes in the mount frame the twin publishes (+x forward, +y left, +z up).
 _R_MOUNT_FROM_OPTICAL = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
@@ -54,7 +58,7 @@ class Adapter:
 
     def __init__(self, sim, robot: str, *, episode_id: str, task: str, instruction: str,
                  max_steps: int = 2500, depth_enabled: bool = True,
-                 calibration_enabled: bool = True) -> None:
+                 calibration_enabled: bool = True, max_tilt: float = 1.0) -> None:
         _require_steward()
         from steward.assets.cobot import TCP_OFFSET
         from steward.ego.ik import CobotIK
@@ -66,6 +70,7 @@ class Adapter:
         self.episode_id, self.task, self.instruction = episode_id, task, instruction
         self.max_steps = max_steps
         self.depth_enabled, self.calibration_enabled = depth_enabled, calibration_enabled
+        self.max_tilt = float(max_tilt)
         self._tcp_offset = np.asarray(TCP_OFFSET, dtype=float)
         self._ik = CobotIK()
         self._steps = 0
@@ -118,7 +123,11 @@ class Adapter:
             values = [float(joints.get(f"{prefix}_joint{i}", 0.0)) for i in range(1, 7)]
             self._ik.set_base(float(odometry.get("x", 0.0)), float(odometry.get("y", 0.0)),
                               float(odometry.get("yaw", 0.0)), lift)
-            link6 = self._ik.fk(PREFIX[arm], values)
+            # Servos holding against a stop report a fraction of a radian past the limit, and the
+            # solver's limit constraint reads the whole configuration: one such value in the other
+            # arm makes every later solve infeasible. Seed through the clamping setter.
+            self._ik.set_joints(prefix, values)
+            link6 = self._ik.fk(prefix)
             position, quaternion = self._tcp_pose(link6)
             opening = self._opening(joints, prefix)
             held = bool((grippers.get(f"{prefix}_link6") or {}).get("holding"))
@@ -155,11 +164,12 @@ class Adapter:
         position = np.asarray(link6["p"], dtype=float) + matrix_from_quat(quaternion) @ self._tcp_offset
         return [float(v) for v in position], quaternion
 
-    def _link6_target(self, tcp_position, tcp_quaternion):
+    def _wrist_target(self, pinch_position, tool_quaternion):
+        """Wrist pose whose grasp site, ``TCP_OFFSET`` along the tool axis, is the requested site."""
         from steward.math3d import matrix_from_quat
 
-        quaternion = [float(v) for v in tcp_quaternion]
-        position = np.asarray(tcp_position, dtype=float) - matrix_from_quat(quaternion) @ self._tcp_offset
+        quaternion = [float(v) for v in tool_quaternion]
+        position = np.asarray(pinch_position, dtype=float) - matrix_from_quat(quaternion) @ self._tcp_offset
         return [float(v) for v in position], quaternion
 
     # -------------------------------------------------------------- commands
@@ -175,11 +185,27 @@ class Adapter:
     def _joint_limits(self, arm: str) -> list[tuple[float, float]]:
         import mujoco
 
+        model = self.sim.model
+        build = getattr(self.sim, "build", None)
+        entity = (getattr(build, "names", None) or {}).get(self.robot)
+        # MuJoCo names every joint of an entity `w:<robot>::<joint>`; looking up the bare
+        # joint id finds nothing (mj_name2id returns -1) and silently reads the last
+        # joint's range, which rejects every target. Resolve through the build's name map.
+        known = entity.joints if entity is not None else {}
         limits = []
         for index in range(1, 7):
-            name = f"{PREFIX[arm]}_joint{index}"
-            joint = mujoco.mj_name2id(self.sim.model, mujoco.mjtObj.mjOBJ_JOINT, name)
-            low, high = self.sim.model.jnt_range[joint]
+            suffix = f"{PREFIX[arm]}_joint{index}"
+            name = known.get(suffix) or suffix
+            joint = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+            if joint < 0:
+                for candidate in range(model.njnt):
+                    full = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, candidate) or ""
+                    if full == suffix or full.endswith(f"::{suffix}"):
+                        joint = candidate
+                        break
+            if joint < 0:
+                raise RequestRejected(f"{arm} joint {index} is not in the twin model")
+            low, high = model.jnt_range[joint]
             limits.append((float(low), float(high)))
         return limits
 
@@ -216,25 +242,41 @@ class Adapter:
                             "EEF target exceeds 6 cm or 0.4 rad from the measured grasp site")
 
     def step_pose(self, command: PoseCommand) -> StepReceipt:
+        """Drive both grasp sites to the requested poses and hold them until the arms settle.
+
+        One step is one increment: the motion executor walks a longer move in ``max_step_m``
+        increments and rejects an active arm that travels more than 0.2 m inside one step, so
+        covering the whole path here would trip its guard. What this step adds is the settle —
+        the twin's servos need tens of ticks to close on a new joint target, and a single-tick
+        step would report a pose the arm never reached.
+        """
         self._active()
         self._complete(command)
         state = self.read_state()
         action: dict[str, dict[str, Any]] = {}
         solved: dict[str, Any] = {}
+        tilts: dict[str, float] = {}
         for arm, target in command.arms.items():
             if isinstance(target, JointTarget):
-                self._check_joints(arm, target.joints)
-                action[arm] = {"joints": [float(v) for v in target.joints], "gripper": target.gripper}
+                action[arm] = {"joints": self._check_joints(arm, target.joints).tolist(),
+                               "gripper": target.gripper}
                 continue
             assert isinstance(target, ArmCommand)
-            position, quaternion = self._link6_target(
-                target.pose.position, target.pose.quaternion)
+            pinch = np.asarray(target.pose.position, dtype=float)
+            quaternion = [float(v) for v in target.pose.quaternion]
+            pose = state.arms[arm].control_pose
+            if (np.linalg.norm(pinch - np.asarray(pose.position, dtype=float)) <= HOLD_TOL
+                    and _quaternion_distance(quaternion, pose.quaternion) <= HOLD_TOL):
+                # Holding an arm where it is must not depend on the solver: the agent holds one
+                # arm still through every step of the other, and a re-solve of an unchanged pose is
+                # where "no solution toward a pose the arm is already in" comes from.
+                action[arm] = {"joints": list(state.arms[arm].joints), "gripper": target.gripper}
+                continue
             # Position servos settle with a steady-state error under load. Command the
             # residual the arm is holding, as an arm's integral term would.
-            measured = np.asarray(state.arms[arm].control_pose.position, dtype=float)
-            residual = np.asarray(target.pose.position, dtype=float) - measured
-            residual = np.clip(residual, -0.02, 0.02)
-            position = [float(v) for v in (np.asarray(position, dtype=float) + residual)]
+            measured = np.asarray(pose.position, dtype=float)
+            residual = np.clip(pinch - measured, -0.02, 0.02)
+            position, quaternion = self._wrist_target(pinch + residual, quaternion)
             try:
                 sensors = self.sim.sensors(self.robot)
                 odometry = sensors.get("odometry") or {}
@@ -242,17 +284,60 @@ class Adapter:
                 current = [float(joints[f"{PREFIX[arm]}_joint{i}"]) for i in range(1, 7)]
                 self._ik.set_base(float(odometry.get("x", 0.0)), float(odometry.get("y", 0.0)),
                                   float(odometry.get("yaw", 0.0)), joints.get("lift"))
-                values = self._ik.solve(PREFIX[arm], position, quaternion, q_init=current)
+                self._ik.set_joints(PREFIX[arm], current)
+                current = self._ik.current(PREFIX[arm])
+                # The Piper wrist cannot hold a strictly vertical tool over most of the table:
+                # joint5 stops at +-70 deg, so a straight-down command misses by centimetres.
+                # solve_tool keeps the grasp site fixed while the tool tilts, which is how the
+                # twin's own skills reach the table.
+                values, tilt = self._ik.solve_tool(
+                    PREFIX[arm], position, quaternion, max_tilt=self.max_tilt, q_init=current)
             except Exception as error:  # noqa: BLE001 - IK failures are recoverable feedback
-                return StepReceipt(accepted=False, state=state, diagnostics={
+                return StepReceipt(accepted=False, state=self.read_state(), diagnostics={
                     "reason": "ik_failed", "arm": arm, "message": str(error),
                 })
             action[arm] = {"joints": [float(v) for v in values], "gripper": target.gripper}
             solved[arm] = [float(v) for v in values]
+            tilts[arm] = float(tilt)
         self._apply(action)
+        self._settle(action)
         return StepReceipt(accepted=True, state=self.read_state(), diagnostics={
-            "commanded_joints": solved or {arm: action[arm]["joints"] for arm in action},
+            "commanded_joints": solved,
+            "tool_tilt_rad": tilts,
         })
+
+    def _settle(self, action: dict[str, dict[str, Any]]) -> None:
+        """Tick until every commanded joint is within ``JOINT_TOL``, or the budget runs out."""
+        targets = {arm: np.asarray(action[arm]["joints"], dtype=float) for arm in action}
+        compensated: set[str] = set()
+        for tick in range(SETTLE_TICKS):
+            if self.ended:
+                return
+            joints = (self.sim.sensors(self.robot).get("joints") or {})
+            error = 0.0
+            for arm, target in targets.items():
+                now = np.asarray([float(joints.get(f"{PREFIX[arm]}_joint{i}", 0.0))
+                                  for i in range(1, 7)], dtype=float)
+                error = max(error, float(np.max(np.abs(now - target))))
+            # Contacts and the gripper need sim time even when the joints already match: a step
+            # that only commands a closure must still let the fingers travel.
+            if error <= JOINT_TOL and tick >= MIN_TICKS:
+                return
+            if 0 < tick and error < 0.1 and any(arm not in compensated for arm in targets):
+                # Integral action once per settle, the way a real servo removes a load offset.
+                for arm, target in targets.items():
+                    if arm in compensated:
+                        continue
+                    now = np.asarray([float(joints.get(f"{PREFIX[arm]}_joint{i}", 0.0))
+                                      for i in range(1, 7)], dtype=float)
+                    targets[arm] = target + (target - now)
+                    compensated.add(arm)
+                self.sim.command(self.robot, {"joints": {
+                    f"{PREFIX[arm]}_joint{i}": float(value)
+                    for arm, target in targets.items()
+                    for i, value in enumerate(target, 1)}})
+            self.sim.step(self._substeps)
+            self._steps += 1
 
     def step_joints(self, command: JointCommand) -> StepReceipt:
         self._active()
@@ -310,7 +395,7 @@ class Adapter:
         frames: dict[str, CameraFrame] = {}
         for name in selected:
             sensor = CAMERAS[name]
-            decoded = decode_rgbd(self.sim.rgbd(self.robot, camera=sensor))
+            decoded = decode_rgbd(self.sim.rgbd(self.robot, sensor))
             rgb = np.asarray(decoded["rgb"], dtype=np.uint8)
             depth = np.asarray(decoded["depth"], dtype=np.float32) if self.depth_enabled else None
             mount, definition = self.sim.camera_pose(self.robot, sensor)
@@ -338,6 +423,8 @@ class Adapter:
     # --------------------------------------------------------------- outcome
     def _success(self) -> bool:
         """Task verdict from exact world relations; never exposed to the agent."""
+        if self.task == "drawer-open":
+            return self._drawer_open()
         relations = (self.sim.world_state() or {}).get("relations") or []
         upper, _, lower = self.task.partition("-on-")
         upper_id, lower_id = self._entity(upper), self._entity(lower or "")
@@ -349,6 +436,17 @@ class Adapter:
             and (relation.get("b") or {}).get("entity") == lower_id
             for relation in relations
         )
+
+    def _drawer_open(self) -> bool:
+        """The drawer's own slide joint has travelled at least 10 cm (the twin's test bar)."""
+        for entity in (self.sim.world_state() or {}).get("entities") or []:
+            for joint in (entity.get("body") or {}).get("joints") or []:
+                if joint.get("id") != "drawer_slide":
+                    continue
+                value = (joint.get("q") or {}).get("value") or []
+                if value and float(value[0]) >= 0.10:
+                    return True
+        return False
 
     def _entity(self, category: str) -> str | None:
         if not category:

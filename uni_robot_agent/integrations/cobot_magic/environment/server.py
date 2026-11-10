@@ -136,6 +136,9 @@ def main(argv=None) -> None:
                         help="'<upper>-on-<lower>' category pair used by the final check")
     parser.add_argument("--instruction", default="Put the bowl on the plate.")
     parser.add_argument("--max-steps", type=int, default=2500, help="25 Hz control steps")
+    parser.add_argument("--max-tilt", type=float, default=1.0,
+                        help="Largest tool tilt in radians when a strictly oriented reach is "
+                             "out of the wrist's range")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--no-depth", action="store_true",
                         help="Capture calibrated RGB only; never return depth")
@@ -172,6 +175,7 @@ def main(argv=None) -> None:
         adapter = Adapter(
             sim, scenario["robots"][0], episode_id=args.run_id, task=args.task,
             instruction=args.instruction, max_steps=args.max_steps,
+            max_tilt=args.max_tilt,
             depth_enabled=not args.no_depth,
             calibration_enabled=not args.no_camera_calibration,
         )
